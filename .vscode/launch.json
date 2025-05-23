@@ -1,0 +1,28 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "./scripts/run.py",
+            "args": [
+                "--config-path", "rolling_forecast_config.json",
+                "--data-name-list", "ETTm2.csv",
+                "--strategy-args", "{\"horizon\":96}",
+                "--model-name", "pre_train.Moment",
+                "--model-hyper-params", "{\"horizon\": 96, \"seq_len\": 512, \"target_dim\": 7, \"is_train\": 1, \"sampling_rate\": 0.05, \"dataset\": \"ETTh1\", \"freq\": \"h\"}",
+                "--plugin-hyper-params","{\"plugin_lr\":0.0001, \"backbone_lr\":0.0001}",
+                "--adapter", "Plugin_adapter",
+                "--gpus", "6",
+                "--num-workers", "1",
+                "--timeout", "60000",
+                "--save-path", "FEW/ETTm2/TimerModel"
+            ],
+            "console": "integratedTerminal"
+        }
+    ]
+}
