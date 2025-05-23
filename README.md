@@ -27,5 +27,5 @@ We provide checkpoints for the basic model used in the paper. Please download th
 - Finetuning the backbone with CoRA:
 
     ```python
-    python ./scripts/run.py --config-path "rolling_forecast_config.json" --data-name-list "ETTm2.csv" --strategy-args '{"horizon":96}' --model-name "pre_train.TimerModel" --model-hyper-params '{"horizon": 96, "seq_len": 384, "target_dim": 7, "is_train": 1, "sampling_rate": 0.05, "dataset": "ETTm2", "freq": "min"}' --plugin-hyper-params '{"backbone_lr": 0.0001, "beta": 0.2, "dropout": 0.2, "head_dropout": 0.05, "num_after": 4, "num_before": 4, "plugin_dim": 256, "plugin_lr": 0.0001}' --adapter "Plugin_adapter"  --gpus 0  --num-workers 1  --timeout 60000  --save-path "FEW/ETTm2/TimerModel"
+    python ./scripts/run.py --config-path "rolling_forecast_config.json" --data-name-list "ETTm2.csv" --strategy-args '{"horizon":96}' --model-name "pre_train.TimerModel" --model-hyper-params '{"horizon": 96, "seq_len": 384, "target_dim": 7, "is_train": 1, "sampling_rate": 0.05, "dataset": "ETTm2", "freq": "min"}' --plugin-hyper-params '{"backbone_lr": 0.0001, "beta": 0.2, "dropout": 0.2, "head_dropout": 0.1, "num_after": 4, "num_before": 3, "plugin_dim": 512, "plugin_lr": 0.0001}' --adapter "Plugin_adapter"  --gpus 0  --num-workers 1  --timeout 60000  --save-path "FEW/ETTm2/TimerModel"
     ```
