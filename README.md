@@ -18,7 +18,7 @@ You can obtained the well pre-processed datasets from [Google Drive](https://dri
 
 ### Prepare Checkpoints for Foundation Models
 
-Currently we release the **TTM** backbone checkpoint. Download `ttm-research-r2.tar.gz` from [Google Drive](https://drive.google.com/file/d/1Yw6spC_Y6HOIZ85y4L8DgXq9I3rhuPlc/view?usp=sharing), then extract it into `ts_benchmark/baselines/pre_train/checkpoints/`:
+We provide the **TTM** backbone checkpoint used for experiment. Download `ttm-research-r2.tar.gz` from [Google Drive](https://drive.google.com/file/d/1Yw6spC_Y6HOIZ85y4L8DgXq9I3rhuPlc/view?usp=sharing), then extract it into `ts_benchmark/baselines/pre_train/checkpoints/`:
 
 ```shell
 mkdir -p ts_benchmark/baselines/pre_train/checkpoints
