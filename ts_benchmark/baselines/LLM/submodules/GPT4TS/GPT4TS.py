@@ -47,8 +47,7 @@ class GPT4TS(nn.Module):
         
         self.cnt = 0
 
-
-    def forward(self, x, itr):
+    def _encode_patches(self, x):
         B, L, M = x.shape
 
         means = x.mean(1, keepdim=True).detach()
@@ -66,6 +65,9 @@ class GPT4TS(nn.Module):
         if self.is_gpt:
             outputs = self.gpt2(inputs_embeds=outputs).last_hidden_state
 
+        return outputs, means, stdev, B, M
+
+    def _decode_patches(self, outputs, means, stdev, B, M):
         outputs = self.out_layer(outputs.reshape(B*M, -1))
         outputs = rearrange(outputs, '(b m) l -> b l m', b=B)
 
@@ -73,3 +75,23 @@ class GPT4TS(nn.Module):
         outputs = outputs + means
 
         return outputs
+
+    def forward(self, x, itr):
+        outputs, means, stdev, B, M = self._encode_patches(x)
+        return self._decode_patches(outputs, means, stdev, B, M)
+
+    def forcast_for_plugin(self, x):
+        outputs, means, stdev, B, M = self._encode_patches(x)
+        self.plugin_means = means
+        self.plugin_stdev = stdev
+        forecast = self._decode_patches(outputs, means, stdev, B, M)
+        embedding = rearrange(outputs, '(b m) n d -> b m n d', b=B, m=M)
+        return forecast, embedding
+
+    def denorm_for_plugin(self, x):
+        return x * self.plugin_stdev + self.plugin_means
+
+    def patchify_for_plugin(self, x):
+        x = rearrange(x, 'b l m -> b m l')
+        x = self.padding_patch_layer(x)
+        return x.unfold(dimension=-1, size=self.patch_size, step=self.stride)

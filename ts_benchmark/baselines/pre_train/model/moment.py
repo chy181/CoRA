@@ -22,7 +22,7 @@ class Moment(nn.Module):
 
 
         self.model = MOMENTPipeline.from_pretrained(
-            "ts_benchmark/baselines/pre_train/checkpoints/MOMENT", 
+            "ts_benchmark/baselines/pre_train/checkpoints/MOMENT-1-small", 
             model_kwargs={
                 'task_name': 'forecasting',
                 'forecast_horizon': config.pred_len,
@@ -55,4 +55,4 @@ class Moment(nn.Module):
         return output, enc_out
     
     def get_settings(self,):
-        return 1024, 8, 8, self.context_length//8
+        return 512, 8, 8, self.context_length//8

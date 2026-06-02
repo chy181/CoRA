@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from pathlib import Path
 # import sys
 # sys.path.insert(0, "ts_benchmark/baselines/LLM/submodel/UniTime/models")
 
@@ -30,18 +31,21 @@ class UniTime(nn.Module):
         self.max_token_num = args.max_token_num
         self.max_backcast_len = args.max_backcast_len
         self.max_forecast_len = args.max_forecast_len
+        self.pred_len = args.pred_len
         # self.logger = args.logger
-            
+
+        gpt2_path = Path('ts_benchmark/baselines/LLM/checkpoints/gpt2')
         if args.pretrain:
-            self.tokenizer = GPT2Tokenizer.from_pretrained('ts_benchmark/baselines/LLM/checkpoints/gpt2')
-            self.backbone = UniTimeGPT2.from_pretrained('ts_benchmark/baselines/LLM/checkpoints/gpt2')
+            self.tokenizer = GPT2Tokenizer.from_pretrained(str(gpt2_path))
+            self.backbone = UniTimeGPT2.from_pretrained(str(gpt2_path))
         else:
             print("------------------no pretrain------------------")
             self.backbone = UniTimeGPT2(GPT2Config())
-            self.tokenizer = GPT2Tokenizer.from_pretrained(
-                    'ts_benchmark/baselines/LLM/checkpoints/gpt2',
-                    load_weights=False,
-                )
+            self.tokenizer = (
+                GPT2Tokenizer.from_pretrained(str(gpt2_path), local_files_only=True)
+                if gpt2_path.exists()
+                else None
+            )
             # print(self.backbone.state_dict().values())
 
         self.backbone.transformer.h = self.backbone.transformer.h[:args.lm_layer_num]
@@ -123,7 +127,7 @@ class UniTime(nn.Module):
         return self.ts_embed_dropout(x_embed), f
 
 
-    def forward(self, info, x_inp, mask):
+    def _encode(self, info, x_inp, mask):
         data_id, seq_len, stride, instruct = info
 
         means = torch.sum(x_inp, dim=1) / torch.sum(mask == 1, dim=1)
@@ -139,14 +143,20 @@ class UniTime(nn.Module):
         mask = mask.transpose(1, 2)
         x_token, n_vars = self.generate_ts_token(x_inp, seq_len, stride, mask)
 
-        if len(instruct) > 0:
+        if len(instruct) > 0 and self.tokenizer is not None:
             instruct_ids = self.tokenizer(instruct, return_tensors='pt').input_ids.to(x_inp.device)
             instruct_embed = self.backbone.transformer.wte(instruct_ids).repeat(x_token.shape[0], 1, 1)
             inputs_embeds = torch.cat((instruct_embed, x_token), dim=1)
         else:
+            instruct_embed = None
             inputs_embeds = x_token
 
         x_enc = self.backbone(inputs_embeds=inputs_embeds)
+        ts_token_num = x_token.shape[1]
+        ts_embedding = x_enc[:, -ts_token_num:, :]
+        return x_enc, ts_embedding, means, stdev, n_vars, data_id, instruct_embed, x_token
+
+    def _decode(self, x_enc, means, stdev, n_vars, data_id, instruct_embed, x_token):
         
         bs, token_num, _ = x_enc.shape
         # print(token_num)
@@ -169,3 +179,31 @@ class UniTime(nn.Module):
         x_out = x_out * (stdev.repeat(1, x_out.shape[1], 1))
         x_out = x_out + (means.repeat(1, x_out.shape[1], 1))
         return x_out
+
+    def forward(self, info, x_inp, mask):
+        x_enc, _, means, stdev, n_vars, data_id, instruct_embed, x_token = self._encode(info, x_inp, mask)
+        return self._decode(x_enc, means, stdev, n_vars, data_id, instruct_embed, x_token)
+
+    def forcast_for_plugin(self, info, x_inp, mask):
+        x_enc, embedding, means, stdev, n_vars, data_id, instruct_embed, x_token = self._encode(info, x_inp, mask)
+        self.plugin_means = means
+        self.plugin_stdev = stdev
+        x_out = self._decode(x_enc, means, stdev, n_vars, data_id, instruct_embed, x_token)
+        embedding = torch.reshape(embedding, (-1, n_vars, embedding.shape[-2], embedding.shape[-1]))
+        return x_out[:, self.max_backcast_len:self.max_backcast_len + self.pred_len, :], embedding
+
+    def denorm_for_plugin(self, x):
+        return x * self.plugin_stdev + self.plugin_means
+
+    def patchify_for_plugin(self, x_inp, seq_len, stride):
+        x_inp = x_inp.transpose(1, 2)
+        if seq_len <= self.patch_len:
+            ts_pad_num = self.patch_len - seq_len
+        else:
+            if seq_len % stride == 0:
+                ts_pad_num = 0
+            else:
+                ts_pad_num = (seq_len // stride) * stride + self.patch_len - seq_len
+        ts_padding = nn.ReplicationPad1d((0, ts_pad_num))
+        x_inp = ts_padding(x_inp)
+        return x_inp.unfold(dimension=-1, size=self.patch_len, step=stride)

@@ -71,17 +71,34 @@ class ProjectBlock(nn.Module):
         
         self.weight_layer = nn.Linear(d_model, 1)
         self.softmax = nn.Softmax(dim=-1)
+        self.context_proj = nn.Linear(d_model, d_model)
+        self.context_score = nn.Linear(d_model, 1)
+        self.context_fuse = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+        )
+        self.context_dropout = nn.Dropout(dropout)
 
     def forward(self, hidden: torch.Tensor):
         residual = hidden
         hidden = self.norm(hidden)
+
+        context = nn.functional.gelu(self.context_proj(hidden))
+        context_weight = torch.softmax(self.context_score(context).squeeze(-1), dim=1)
+        context = (context * context_weight.unsqueeze(-1)).sum(dim=1, keepdim=True)
+        context = context.expand(-1, hidden.size(1), -1, -1)
+        hidden = hidden + self.context_dropout(
+            self.context_fuse(torch.cat([hidden, context], dim=-1))
+        )
 
         hidden = self.dropout1(nn.functional.gelu(self.fc1(hidden)))
         hidden = self.fc2(hidden)
         avg = hidden.mean(-2)
         hidden = self.dropout2(hidden)
         
-        weight = self.softmax(self.weight_layer(avg).squeeze())
+        weight = self.softmax(self.weight_layer(avg).squeeze(-1))
         hidden = hidden * weight.unsqueeze(-1).unsqueeze(-1)
 
         out = hidden + residual
@@ -90,18 +107,6 @@ class ProjectBlock(nn.Module):
 class Plugin(nn.Module):
     def __init__(self, backbone=None, pth='', configs=None):
         super().__init__()
-
-        # configs.plugin.plugin_dim=1024
-        # configs.plugin.dropout=0.3
-        # configs.plugin.head_dropout=0.3
-        # configs.plugin.num_before=3
-        # configs.plugin.num_after=5
-        # configs.plugin.beta = 0.2
-        configs.plugin.gama =0.001
-        configs.plugin.K = 3
-        configs.plugin.M = configs.enc_in//10+1
-        configs.plugin.de = 4
-        configs.plugin.thresold = 0.3
 
         self.d_model = configs.plugin.plugin_dim
         self.n_vars = configs.enc_in
@@ -120,6 +125,12 @@ class Plugin(nn.Module):
             'pos': nn.Sequential(nn.Linear(model_dim,model_dim),nn.Dropout(dropout), nn.GELU(), nn.Linear(model_dim,self.d_model)),
             'neg': nn.Sequential(nn.Linear(model_dim,model_dim),nn.Dropout(dropout), nn.GELU(), nn.Linear(model_dim,self.d_model))
         })
+        self.channel_embedding = nn.ParameterDict({
+            'pos': nn.Parameter(torch.empty(1, self.n_vars, 1, self.d_model)),
+            'neg': nn.Parameter(torch.empty(1, self.n_vars, 1, self.d_model)),
+        })
+        for embedding_param in self.channel_embedding.values():
+            nn.init.trunc_normal_(embedding_param, std=0.02)
         
 
         n=configs.plugin.num_before
@@ -138,15 +149,19 @@ class Plugin(nn.Module):
                          K=configs.plugin.K, de=configs.plugin.de, thresold=configs.plugin.thresold)
         
         self.prediction_length = configs.horizon
+        self.output_patch_len = self.prediction_length
+        self.label_len = max(configs.seq_len - self.output_patch_len, 0)
 
-        self.head = nn.ModuleDict(
-            {'pos':PredictionHead(False,self.n_vars,self.patch_num*self.d_model,96,head_dropout=head_dropout),
-             'neg':PredictionHead(False,self.n_vars,self.patch_num*self.d_model,96,head_dropout=head_dropout)})
+        self.head = PredictionHead(
+            False,
+            self.n_vars,
+            self.patch_num * self.d_model,
+            self.prediction_length,
+            head_dropout=head_dropout,
+        )
         self.norm = nn.LayerNorm(self.d_model)
         self.beta = nn.Parameter(torch.tensor([configs.plugin.beta]*self.n_vars))
         self.gama = configs.plugin.gama
-        self.label_len = configs.seq_len - 96
-        self.output_patch_len = 96
         self.config = configs
 
     def freeze_backbone(self):
@@ -197,21 +212,39 @@ class Plugin(nn.Module):
         # # # embedding = rearrange(embedding,'b k p d -> b k p d', k=self.n_vars)
 
         embedding = self.dropout(embedding)
-        input = input.unfold(1, self.patch_size, self.stride)
-        input = rearrange(input,'b n c p -> (b n) c p')
+        if hasattr(self.fm, 'patchify_for_plugin'):
+            input_patches = self.fm.patchify_for_plugin(input)
+            input_patches = rearrange(input_patches, 'b c p l -> (b p) c l')
+        else:
+            input_patches = input.unfold(1, self.patch_size, self.stride)
+            input_patches = rearrange(input_patches, 'b n c p -> (b n) c p')
 
-        self.contrastive.cal_corr(input, embedding)
+        input_patch_num = input_patches.shape[0] // b
+        embedding_for_contrastive = embedding
+        contrastive_patch_slice = slice(None)
+        if embedding.shape[2] == input_patch_num + 1:
+            # TinyTimeMixer prepends a frequency prefix token that has no matching time patch.
+            embedding_for_contrastive = embedding[:, :, 1:, :]
+            contrastive_patch_slice = slice(1, None)
+        elif embedding.shape[2] != input_patch_num:
+            raise RuntimeError(
+                f'Patch count mismatch between input patches ({input_patch_num}) and embeddings ({embedding.shape[2]}).'
+            )
+
+        if self.training:
+            self.contrastive.cal_corr(input_patches, embedding_for_contrastive)
         
         loss={}
         enchance={}
         for polarity in ['pos','neg']:   
-            x = self.adapter[polarity](embedding)
+            x = self.adapter[polarity](embedding) + self.channel_embedding[polarity]
             x_mixer = x
             for mixer in self.projecions_before[polarity]:
                 x_mixer = mixer(x_mixer)
 
             if self.training:
-                cc_loss, A = self.contrastive(rearrange(x_mixer,'b c p d -> (b p) c d'), polarity) 
+                x_contrastive = x_mixer[:, :, contrastive_patch_slice, :]
+                cc_loss, A = self.contrastive(rearrange(x_contrastive,'b c p d -> (b p) c d'), polarity)
                 loss[polarity] = cc_loss
 
             for mixer in self.projecions_after[polarity]:
@@ -221,8 +254,11 @@ class Plugin(nn.Module):
             enchance[polarity] = x_mixer
 
         enchance = enchance['neg'] + enchance['pos']
-        enchance = self.head[polarity](enchance)
-        output_plugin = self.fm.model.denorm_for_plugin(enchance)
+        enchance = self.head(enchance)
+        if hasattr(self.fm, 'denorm_for_plugin'):
+            output_plugin = self.fm.denorm_for_plugin(enchance)
+        else:
+            output_plugin = self.fm.model.denorm_for_plugin(enchance)
         output = (output_plugin*self.beta + output * (1-self.beta))
 
         if self.training:
@@ -233,16 +269,21 @@ class Plugin(nn.Module):
 
     
 class Channel_contrastive(nn.Module):
-    def __init__(self, n_vars, model_dim, M=3, K=3, de=3, thresold=0.3):
+    def __init__(self, n_vars, model_dim, M=3, K=3, de=3, thresold=0.3, gate_tau=0.1):
         super().__init__()
         self.N = n_vars
         self.M = M
         self.K = K
-        self.thresold = thresold
+        self.gate_tau = gate_tau
+        init_threshold = torch.tensor(float(thresold), dtype=torch.float32).clamp_min(1e-6)
+        self.threshold_param = nn.Parameter(torch.log(torch.expm1(init_threshold)))
         self.q = nn.Parameter(torch.randn(n_vars, M)) 
         self.V1 = nn.Parameter(torch.randn(M, de))
         self.V2 = nn.Parameter(torch.randn(M, de))
         self.f = nn.Linear(model_dim, self.K)
+
+    def get_threshold(self):
+        return F.softplus(self.threshold_param)
     
     def polynomial(self, embedding):
         '''
@@ -258,10 +299,11 @@ class Channel_contrastive(nn.Module):
         return Q
 
     def composition(self, ts, Q):
-        V = torch.mm(self.V1, self.V2.transpose(0,1)).unsqueeze(0).expand(Q.size(0),-1,-1)
-        Corr = torch.sigmoid( torch.bmm (torch.bmm(Q , V) , Q.permute(0, 2, 1)))
+        V = torch.mm(self.V1, self.V2.transpose(0,1))
+        V = torch.sigmoid(F.relu(V)).unsqueeze(0).expand(Q.size(0), -1, -1)
+        Corr = torch.bmm(torch.bmm(Q, V), Q.permute(0, 2, 1))
 
-        return (self.cal_pearson_corr(ts) + Corr)/2
+        return self.cal_pearson_corr(ts) + Corr
 
     def cal_corr(self,ts,embedding):
         Q = self.polynomial(embedding)
@@ -269,10 +311,11 @@ class Channel_contrastive(nn.Module):
 
     def forward(self,features, polarity):
         A = self.A
+        threshold = self.get_threshold()
         if polarity == 'neg':
-            A = A*((A<-1*self.thresold ).float()*-1) + A*(A==1).float()
+            A = torch.relu(-A) * torch.sigmoid((-A - threshold) / self.gate_tau)
         else:
-            A = A*((A>self.thresold ).float())
+            A = torch.relu(A) * torch.sigmoid((A - threshold) / self.gate_tau)
 
         A_pos = A 
         dist_pos = self.get_feature_dis(features)

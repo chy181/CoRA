@@ -1,22 +1,27 @@
 # -*- coding: utf-8 -*-
+from importlib import import_module
+
 __all__ = [
     "TimerModel",
-    "TimesFM",
-    "UniTS",
     "Moment",
     "TinyTimeMixer",
-    "Moirai",
-    "Chronos",
-    "RoseModel"
 ]
 
 
-from ts_benchmark.baselines.pre_train.model.timer import TimerModel
-from ts_benchmark.baselines.pre_train.model.timesfm import TimesFM
-from ts_benchmark.baselines.pre_train.model.units import UniTS
-from ts_benchmark.baselines.pre_train.model.moment import Moment
-from ts_benchmark.baselines.pre_train.model.tinytimemixer import TinyTimeMixer
-from ts_benchmark.baselines.pre_train.model.moirai import Moirai
-from ts_benchmark.baselines.pre_train.model.ChronosModel import Chronos
-from ts_benchmark.baselines.pre_train.model.RoseModel import RoseModel
+def _optional_import(module_path: str, attr_name: str):
+    try:
+        module = import_module(module_path)
+    except ImportError:
+        return None
+    return getattr(module, attr_name, None)
 
+
+TimerModel = _optional_import(
+    "ts_benchmark.baselines.pre_train.model.timer", "TimerModel"
+)
+Moment = _optional_import(
+    "ts_benchmark.baselines.pre_train.model.moment", "Moment"
+)
+TinyTimeMixer = _optional_import(
+    "ts_benchmark.baselines.pre_train.model.tinytimemixer", "TinyTimeMixer"
+)

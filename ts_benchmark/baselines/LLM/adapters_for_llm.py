@@ -26,11 +26,11 @@ DEFAULT_LLM_BASED_HYPER_PARAMS = {
     "quantiles_num": 20,
     "ckpt_path":"",
     "dataset":"etth1",
-    "patience": 1,
+    "patience": 3,
     "num_epochs": 10,
     "lradj": "type1",
     "freq": "H",
-    "batch_size": 1,
+    "batch_size": 64,
     'label_len':96,
     "num_workers": 0,
     "freq": "h",
@@ -61,7 +61,7 @@ DEFAULT_LLM_BASED_HYPER_PARAMS = {
     "dropout": 0.1,
     "token_len": 96,
     "use_p": 0,
-
+    "loss":"MSE",
     "ln": 0, # s2lpllm
     "task_name": "long_term_forecast",
     "patch_size": 16,

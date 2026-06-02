@@ -1,2 +1,67 @@
+# Python
 __pycache__/
-.vscode
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+my_env/
+venv/
+.venv/
+env/
+
+# IDE / editor
+.vscode/
+.idea/
+.history/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Datasets (download per README)
+dataset/
+
+# Foundation-model checkpoints (download separately)
+ts_benchmark/baselines/LLM/checkpoints/
+ts_benchmark/baselines/pre_train/checkpoints/
+
+# Run artifacts
+result/
+sweep_logs/
+*.log
+
+# Experiment trackers
+wandb/
+runs/
+lightning_logs/
+tb_logs/
+mlruns/
+
+# Ray / distributed temp
+ray_results/
+tmp_*/
+
+# Caches (HuggingFace, datasets, etc.)
+.cache/
+hf_cache/
+huggingface/
+
+# Secrets / env
+.env
+.env.*
+
+# Agent / assistant instruction files
+AGENTS.md
+CLAUDE.md

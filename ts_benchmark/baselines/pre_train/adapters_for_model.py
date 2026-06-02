@@ -22,7 +22,10 @@ from ts_benchmark.baselines.utils import (
 from ts_benchmark.models.model_base import ModelBase, BatchMaker
 from ts_benchmark.utils.data_processing import split_before
 
-from thop import profile
+try:
+    from thop import profile
+except ImportError:
+    profile = None
 # import pycuda.driver as cuda
 
 DEFAULT_PreTrain_BASED_HYPER_PARAMS = {
@@ -163,32 +166,33 @@ class PreTrainAdapter(ModelBase):
         self.model.eval()
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        for input, target, input_mark, target_mark in valid_data_loader:
-            input, target, input_mark, target_mark = (
-                input.to(device),
-                target.to(device),
-                input_mark.to(device),
-                target_mark.to(device),
-            )
-            # decoder input
-            dec_input = torch.zeros_like(target[:, -config.horizon :, :]).float()
-            dec_input = (
-                torch.cat([target[:, : config.label_len, :], dec_input], dim=1)
-                .float()
-                .to(device)
-            )
+        with torch.no_grad():
+            for input, target, input_mark, target_mark in valid_data_loader:
+                input, target, input_mark, target_mark = (
+                    input.to(device),
+                    target.to(device),
+                    input_mark.to(device),
+                    target_mark.to(device),
+                )
+                # decoder input
+                dec_input = torch.zeros_like(target[:, -config.horizon :, :]).float()
+                dec_input = (
+                    torch.cat([target[:, : config.label_len, :], dec_input], dim=1)
+                    .float()
+                    .to(device)
+                )
 
-            output = self.model(input, dec_input, input_mark, target_mark, device)
+                output = self.model(input, dec_input, input_mark, target_mark, device)
 
-            if self.model_name == 'TimerModel':
-                target = target[:, -config.seq_len:, :]
-                output = output[:, -config.seq_len:, :]
-            else:
-                target = target[:, -config.horizon :, :]
-                output = output[:, -config.horizon :, :]
-            
-            loss = criterion(output, target).detach().cpu().numpy()
-            total_loss.append(loss)
+                if self.model_name == 'TimerModel':
+                    target = target[:, -config.seq_len:, :]
+                    output = output[:, -config.seq_len:, :]
+                else:
+                    target = target[:, -config.horizon :, :]
+                    output = output[:, -config.horizon :, :]
+
+                loss = criterion(output, target).detach().cpu().numpy()
+                total_loss.append(loss)
 
         total_loss = np.mean(total_loss)
         self.model.train()
@@ -267,12 +271,8 @@ class PreTrainAdapter(ModelBase):
             self.model_name,
         )
 
-        if self.model_name == "Chronos":
-            total_params = sum(p.numel() for p in self.model.pipeline.model.parameters())
-            print(f"Total parameters: {total_params}")
-        else:
-            total_params = sum(p.numel() for p in self.model.parameters())
-            print(f"Total parameters: {total_params}")
+        total_params = sum(p.numel() for p in self.model.parameters())
+        print(f"Total parameters: {total_params}")
         self.model.to(device)
 
         if config.is_train:
@@ -281,19 +281,11 @@ class PreTrainAdapter(ModelBase):
                 os.makedirs("ts_benchmark/baselines/pre_train/checkpoints/pretrain")
                 
             
-            if self.model_name == "Chronos":
-                total_params = sum(
-                    p.numel() for p in self.model.pipeline.model.parameters() if p.requires_grad
-                )
-                print(f"Total trainable parameters: {total_params}")
-                optimizer = optim.Adam(self.model.pipeline.model.parameters(), lr=config.lr)
-                
-            else:
-                total_params = sum(
-                    p.numel() for p in self.model.parameters() if p.requires_grad
-                )
-                print(f"Total trainable parameters: {total_params}")
-                optimizer = optim.Adam(self.model.parameters(), lr=config.lr)
+            total_params = sum(
+                p.numel() for p in self.model.parameters() if p.requires_grad
+            )
+            print(f"Total trainable parameters: {total_params}")
+            optimizer = optim.Adam(self.model.parameters(), lr=config.lr)
                 
             criterion = nn.MSELoss()
             self.early_stopping = EarlyStopping(patience=config.patience)
@@ -319,9 +311,8 @@ class PreTrainAdapter(ModelBase):
 
                     output = self.model(input, dec_input, input_mark, target_mark, device)
                     if self.model_name == 'TimerModel':
-                        # print(target.shape(name=None))
-                        target = target[:, :config.seq_len, :]
-                        output = output[:, :config.seq_len, :]
+                        target = target[:, -config.seq_len:, :]
+                        output = output[:, -config.seq_len:, :]
                     else:
                         target = target[:, -config.horizon :, :]
                         output = output[:, -config.horizon :, :]

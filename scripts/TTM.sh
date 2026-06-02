@@ -1,0 +1,5 @@
+ # backbone
+ python ./scripts/run.py --config-path "rolling_forecast_config.json" --data-name-list "ETTm2.csv" --strategy-args '{"horizon":96}' --model-name "pre_train.TinyTimeMixer"   --model-hyper-params '{"horizon": 96, "seq_len": 512, "dataset": "ETTm2", "freq": "min", "target_dim": 7, "is_train": 1, "sampling_rate": 0.05}' --adapter "PreTrain_adapter"  --gpus 3  --num-workers 1  --timeout 60000  --save-path "ETTm2/TTM"
+
+ #CoRA
+ python ./scripts/run.py --config-path "rolling_forecast_config.json" --data-name-list "ETTm2.csv" --strategy-args '{"horizon":96}' --model-name "pre_train.TinyTimeMixer" --model-hyper-params '{"horizon": 96, "seq_len":512, "target_dim": 7, "is_train": 1, "num_epochs": 50, "batch_size": 64, "sampling_rate": 0.05, "dataset":"ETTm2", "freq": "min", "norm": true, "lr": 0.001, "patience": 5}' --plugin-hyper-params '{"backbone_lr": 0.0005,"plugin_lr": 0.0001, "beta": 0.5, "dropout": 0.2, "head_dropout": 0.1, "num_after": 2, "num_before": 2,"plugin_dim": 192, "gama": 0.001, "K": 2, "M": 2, "de": 2, "thresold": 0.2}' --adapter "Plugin_adapter" --eval-backend "sequential" --gpus 0 --num-workers 1 --timeout 60000 --save-path "ETTm2/TTM"

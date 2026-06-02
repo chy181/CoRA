@@ -1,3 +1,4 @@
+import copy
 import os
 import time
 from typing import Type, Dict, Optional, Tuple
@@ -13,7 +14,6 @@ from ts_benchmark.plugin.plugin import Plugin
 from ts_benchmark.plugin.plugin_ar import Plugin as Plugin_AG
 from ts_benchmark.baselines.time_series_library.utils.tools import (
     EarlyStopping,
-    adjust_learning_rate,
 )
 from ts_benchmark.baselines.utils import (
     forecasting_data_provider,
@@ -23,7 +23,10 @@ from ts_benchmark.baselines.utils import (
 from ts_benchmark.models.model_base import ModelBase, BatchMaker
 from ts_benchmark.utils.data_processing import split_before
 
-from thop import profile
+try:
+    from thop import profile
+except ImportError:
+    profile = None
 
 
 
@@ -50,12 +53,14 @@ DEFAULT_PreTrain_BASED_HYPER_PARAMS = {
     "is_train": 0,
     "get_train": 0,
     "ending": 0,
-    # "lradj": "cosine",
-    "lradj": "type1",
+    "lradj": "type3",
     "patch_size": 64,
     "patch_len": 96,
     "use_plugin":False,
     "alpha":0.5,
+    "stage1_batch_size": None,
+    "stage2_batch_size": None,
+    "train_stages": "plugin,joint",
 
 }
 
@@ -64,6 +69,7 @@ DEFAULT_PlUGIN_HYPER_PARAMS = {
     "plugin_lradj":"type1",
     "gama" :0.001,
     "K" : 3,
+    "M" : None,
     "de" : 4,
     "thresold" : 0.3,
 } 
@@ -183,7 +189,156 @@ class PluginAdapter(ModelBase):
 
     def forecast(self, horizon: int, series: pd.DataFrame, **kwargs) -> np.ndarray:
         return super().forecast(horizon, series, **kwargs)
-    
+
+    def _finalize_plugin_hyper_params(self):
+        if getattr(self.config.plugin, "M", None) is None:
+            self.config.plugin.M = self.config.enc_in // 10 + 1
+
+    def _get_plugin_parameters(self):
+        return [
+            param
+            for name, param in self.model.named_parameters()
+            if not name.startswith("fm.")
+        ]
+
+    def _get_backbone_parameters(self):
+        return list(self.model.fm.parameters())
+
+    def _count_trainable_parameters(self, parameters):
+        return sum(param.numel() for param in parameters if param.requires_grad)
+
+    def _compute_stage_lr(self, base_lr, lradj, epoch):
+        if lradj == "type1":
+            return base_lr * (0.5 ** ((epoch - 1) // 1))
+        if lradj == "type2":
+            schedule = {
+                2: 5e-5,
+                4: 1e-5,
+                6: 5e-6,
+                8: 1e-6,
+                10: 5e-7,
+                15: 1e-7,
+                20: 5e-8,
+            }
+            return schedule.get(epoch)
+        if lradj == "cosine":
+            return base_lr / 2 * (1 + math.cos(epoch / self.config.num_epochs * math.pi))
+        return None
+
+    def _adjust_stage_learning_rates(self, optimizer, epoch, lr_settings):
+        updated_lrs = {}
+        for param_group in optimizer.param_groups:
+            group_name = param_group.get("name", "default")
+            base_lr, lradj = lr_settings[group_name]
+            lr = self._compute_stage_lr(base_lr, lradj, epoch)
+            if lr is None:
+                continue
+            param_group["lr"] = lr
+            updated_lrs[group_name] = lr
+
+        if updated_lrs:
+            lr_message = ", ".join(
+                f"{group_name}: {lr:.8f}" for group_name, lr in updated_lrs.items()
+            )
+            print(f"Updating learning rate to {lr_message}")
+
+    def _build_stage_optimizer(self, stage_name):
+        plugin_params = self._get_plugin_parameters()
+        backbone_params = self._get_backbone_parameters()
+
+        if stage_name == "plugin":
+            self.model.freeze_backbone()
+            optimizer = optim.Adam(
+                [param for param in plugin_params if param.requires_grad],
+                lr=self.config.plugin.plugin_lr,
+            )
+            lr_settings = {
+                "default": (
+                    self.config.plugin.plugin_lr,
+                    self.config.plugin.plugin_lradj,
+                )
+            }
+            trainable_counts = {
+                "plugin": self._count_trainable_parameters(plugin_params),
+                "backbone": self._count_trainable_parameters(backbone_params),
+            }
+            return optimizer, lr_settings, trainable_counts
+
+        if stage_name == "joint":
+            self.model.unfreeze_backbone()
+            optimizer = optim.Adam(
+                [
+                    {
+                        "params": [param for param in plugin_params if param.requires_grad],
+                        "lr": self.config.plugin.plugin_lr,
+                        "name": "plugin",
+                    },
+                    {
+                        "params": [param for param in backbone_params if param.requires_grad],
+                        "lr": self.config.plugin.backbone_lr,
+                        "name": "backbone",
+                    },
+                ]
+            )
+            lr_settings = {
+                "plugin": (
+                    self.config.plugin.plugin_lr,
+                    self.config.plugin.plugin_lradj,
+                ),
+                "backbone": (
+                    self.config.plugin.backbone_lr,
+                    self.config.plugin.backbone_lradj,
+                ),
+            }
+            trainable_counts = {
+                "plugin": self._count_trainable_parameters(plugin_params),
+                "backbone": self._count_trainable_parameters(backbone_params),
+            }
+            return optimizer, lr_settings, trainable_counts
+
+        raise ValueError(f"Unsupported training stage: {stage_name}")
+
+    def _resolve_stage_batch_size(self, stage_name):
+        if stage_name == "plugin":
+            return getattr(self.config, "stage1_batch_size", None) or self.config.batch_size
+        if stage_name == "joint":
+            return getattr(self.config, "stage2_batch_size", None) or self.config.batch_size
+        raise ValueError(f"Unsupported training stage: {stage_name}")
+
+    def _build_train_data_loader(self, train_data, train_drop_last, batch_size):
+        return forecasting_data_provider(
+            train_data,
+            self.config,
+            timeenc=1,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=train_drop_last,
+            data_info='train',
+            sampling_rate=self.config.sampling_rate,
+            sampling_strategy=self.config.sampling_strategy,
+            sampling_basis=self.config.sampling_basis,
+        )
+
+    def _get_training_stages(self):
+        stage_title_map = {
+            "plugin": "plugin only",
+            "joint": "joint finetune",
+        }
+        configured = getattr(self.config, "train_stages", "plugin,joint")
+        if isinstance(configured, str):
+            stage_names = [item.strip() for item in configured.split(",") if item.strip()]
+        else:
+            stage_names = list(configured)
+
+        if not stage_names:
+            raise ValueError("train_stages must contain at least one stage")
+
+        stages = []
+        for stage_name in stage_names:
+            if stage_name not in stage_title_map:
+                raise ValueError(f"Unsupported training stage: {stage_name}")
+            stages.append((stage_name, stage_title_map[stage_name]))
+        return stages
 
     def validate(self, valid_data_loader, criterion):
         config = self.config
@@ -191,34 +346,34 @@ class PluginAdapter(ModelBase):
         self.model.eval()
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        for input, target, input_mark, target_mark in valid_data_loader:
-            input, target, input_mark, target_mark = (
-                input.to(device),
-                target.to(device),
-                input_mark.to(device),
-                target_mark.to(device),
-            )
-            # decoder input
-            dec_input = torch.zeros_like(target[:, -config.horizon :, :]).float()
-            dec_input = (
-                torch.cat([target[:, : config.label_len, :], dec_input], dim=1)
-                .float()
-                .to(device)
-            )
+        with torch.no_grad():
+            for input, target, input_mark, target_mark in valid_data_loader:
+                input, target, input_mark, target_mark = (
+                    input.to(device),
+                    target.to(device),
+                    input_mark.to(device),
+                    target_mark.to(device),
+                )
+                # decoder input
+                dec_input = torch.zeros_like(target[:, -config.horizon :, :]).float()
+                dec_input = (
+                    torch.cat([target[:, : config.label_len, :], dec_input], dim=1)
+                    .float()
+                    .to(device)
+                )
 
+                output = self.model(input, dec_input, input_mark, target_mark, device)
 
-            output = self.model(input, dec_input, input_mark, target_mark, device)
-    
-            if self.model_name == 'TimerModel':
-                target = target[:, -config.seq_len:, :]
-                output = output[:, -config.seq_len:, :]
-            else:
-                target = target[:, -config.horizon :, :]
-                output = output[:, -config.horizon :, :]
-            
-            loss = criterion(output, target)
-            loss = loss.detach().cpu().numpy()
-            total_loss.append(loss)
+                if self.model_name == 'TimerModel':
+                    target = target[:, -config.seq_len:, :]
+                    output = output[:, -config.seq_len:, :]
+                else:
+                    target = target[:, -config.horizon :, :]
+                    output = output[:, -config.horizon :, :]
+
+                loss = criterion(output, target)
+                loss = loss.detach().cpu().numpy()
+                total_loss.append(loss)
 
         total_loss = np.mean(total_loss)
         self.model.train()
@@ -244,6 +399,8 @@ class PluginAdapter(ModelBase):
         else:
             train_drop_last = True
             self.multi_forecasting_hyper_param_tune(train_valid_data)
+
+        self._finalize_plugin_hyper_params()
         
         config = self.config
         train_data, valid_data = train_val_split(
@@ -277,18 +434,6 @@ class PluginAdapter(ModelBase):
                 data_info='val',
             )
 
-        train_dataset, train_data_loader = forecasting_data_provider(
-            train_data,
-            config,
-            timeenc=1,
-            batch_size=config.batch_size,
-            shuffle=True,
-            drop_last=train_drop_last,
-            data_info='train',
-            sampling_rate=config.sampling_rate,
-            sampling_strategy=config.sampling_strategy,
-            sampling_basis=config.sampling_basis,
-        )
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
 
@@ -307,58 +452,55 @@ class PluginAdapter(ModelBase):
             self.model_name,
         )
 
-        if self.model_name == "Chronos":
-            total_params = sum(p.numel() for p in self.model.pipeline.model.parameters())
-            print(f"Total parameters: {total_params}")
-        else:
-            total_params = sum(p.numel() for p in self.model.parameters())
-            print(f"Total parameters: {total_params}")
+        total_params = sum(p.numel() for p in self.model.parameters())
+        print(f"Total parameters: {total_params}")
         
         self.model.to(device)
         
         # config.lr = config.plugin.lr_backbone
         if config.is_train:
             
-            if self.model_name == "Chronos":
-                total_params = sum(
-                    p.numel() for p in self.model.pipeline.model.parameters() if p.requires_grad
-                )
-                print(f"Total trainable parameters: {total_params}")
-
-            else:
-                total_params = sum(
-                    p.numel() for p in self.model.parameters() if p.requires_grad
-                )
-                print(f"Total trainable parameters: {total_params}")
+            total_params = sum(
+                p.numel() for p in self.model.parameters() if p.requires_grad
+            )
+            print(f"Total trainable parameters: {total_params}")
 
 
-            if config.loss == 'MSE':
-                criterion = nn.MSELoss()
-            elif config.loss == 'MAE':
-                criterion = nn.L1Loss()
-            elif config.loss == 'Huber':
-                criterion = nn.HuberLoss()
+           # if config.loss == 'MSE':
+           #     criterion = nn.MSELoss()
+           # elif config.loss == 'MAE':
+           #     criterion = nn.L1Loss()
+           # elif config.loss == 'Huber':
+           #     criterion = nn.HuberLoss()
             criterion = nn.MSELoss()
-       
-            for train_mode in ['plugin']:
-            # for train_mode in ['plugin', 'all']:    
-                if train_mode == 'plugin':
-                    # self.model.freeze_backbone() 
-                    optimizer = optim.Adam(self.model.fm.parameters(), lr=config.plugin.plugin_lr)
-                    self.early_stopping = EarlyStopping(patience=config.patience)
-                    config.lr = config.plugin.plugin_lr
-                    config.lradj = config.plugin.plugin_lradj
 
-                elif train_mode == 'all':
-                    # self.model.unfreeze_backbone()
-                    optimizer = optim.Adam(self.model.parameters(), lr=config.plugin.backbone_lr)
-                    self.early_stopping.counter = 0
-                    self.early_stopping.early_stop = False
-                    config.lr = config.plugin.backbone_lr
+            training_stages = self._get_training_stages()
+
+            for stage_name, stage_title in training_stages:
+                if (
+                    stage_name == "joint"
+                    and hasattr(self, "early_stopping")
+                    and self.early_stopping.check_point is not None
+                ):
                     self.model.load_state_dict(self.early_stopping.check_point)
-                    config.lradj = config.plugin.backbone_lradj
 
-                print(f'---------------- Training {train_mode}')
+                optimizer, lr_settings, trainable_counts = self._build_stage_optimizer(
+                    stage_name
+                )
+                self.early_stopping = EarlyStopping(patience=config.patience)
+                self.config.ending = 1
+                stage_batch_size = self._resolve_stage_batch_size(stage_name)
+                _, train_data_loader = self._build_train_data_loader(
+                    train_data, train_drop_last, stage_batch_size
+                )
+
+                print(f"---------------- Training stage: {stage_title}")
+                print(
+                    "Trainable parameters "
+                    f"(plugin={trainable_counts['plugin']}, backbone={trainable_counts['backbone']})"
+                )
+                print(f"Training batch size for stage {stage_name}: {stage_batch_size}")
+
                 for epoch in range(config.num_epochs):
                     self.model.train()
                     for i, (input, target, input_mark, target_mark) in enumerate(
@@ -370,7 +512,6 @@ class PluginAdapter(ModelBase):
                             input_mark.to(device),
                             target_mark.to(device),
                         )
-                        # decoder input
                         dec_input = torch.zeros_like(target[:, -config.horizon :, :]).float()
                         dec_input = (
                             torch.cat([target[:, : config.label_len, :], dec_input], dim=1)
@@ -378,20 +519,22 @@ class PluginAdapter(ModelBase):
                             .to(device)
                         )
 
-                        output, loss_cc = self.model(input, dec_input, input_mark, target_mark, device)
-                        # output = self.model(input, dec_input, input_mark, target_mark, device)
-
-                        
+                        output, loss_cc = self.model(
+                            input, dec_input, input_mark, target_mark, device
+                        )
 
                         if self.model_name == 'TimerModel':
+                        
+                            # target = target[:, -config.seq_len:, :]
+                            # output = output[:, -config.seq_len:, :]
                             target = target[:, -config.seq_len:, :]
                             output = output[:, -config.seq_len:, :]
-                           
+                            # self.config.label_len
                         else:
                             target = target[:, -config.horizon :, :]
                             output = output[:, -config.horizon :, :]
-                        
-                        loss = criterion(output, target) + (output - target).abs().mean()*self.config.alpha
+
+                        loss = criterion(output, target)  + (output - target).abs().mean() * self.config.alpha
                         optimizer.zero_grad()
                         loss = loss + loss_cc.mean()
                         loss.requires_grad_(True)
@@ -399,18 +542,25 @@ class PluginAdapter(ModelBase):
                             loss.backward(retain_graph=True)
                         optimizer.step()
 
-                    self.config.ending = 1
                     if train_ratio_in_tv != 1:
                         valid_loss = self.validate(valid_data_loader, criterion)
                         self.early_stopping(valid_loss, self.model)
                         if self.early_stopping.early_stop:
                             self.config.ending = 0
-                            print(f"Early Stopping {train_mode} train ----------------")
+                            print(f"Early Stopping {stage_title} ----------------")
                             break
-                    adjust_learning_rate(optimizer, epoch + 1, config)
+                    else:
+                        self.early_stopping.check_point = copy.deepcopy(
+                            self.model.state_dict()
+                        )
+
+                    self._adjust_stage_learning_rates(optimizer, epoch + 1, lr_settings)
+
+                if self.early_stopping.check_point is not None:
+                    self.model.load_state_dict(self.early_stopping.check_point)
 
                 if self.config.ending:
-                    print(f"Ending {train_mode} train ----------------")
+                    print(f"Ending {stage_title} ----------------")
 
                 
 
@@ -605,4 +755,3 @@ def Plugin_adapter(model_info: Type[object]) -> object:
             "norm": "norm",
         },
     )
-
